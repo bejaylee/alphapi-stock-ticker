@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# 备份与本地配置（勿上传）
+main_backup.py
+*_backup.py
+config_local.py
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
