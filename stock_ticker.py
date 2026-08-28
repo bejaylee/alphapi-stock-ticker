@@ -46,9 +46,9 @@ PAGES = [
     [("上证指数", "sh000001", "CN"), ("创业板指", "sz399006", "CN")],
     [("深证成指", "sz399001", "CN"), ("科创50",   "sh000688", "CN")],
     [("韩国综合", "KS11",     "KR"), ("日经225",   "N225",     "JP")],
-    [("费城半导体", "usSOXX", "US"), ("纳斯达克",  "usIXIC",   "US")],
+    [("SOX",      "usSOXX",   "US"), ("IXIC",      "usIXIC",   "US")],
 ]
-POS = [(0, 24, 44), (64, 88, 108)]
+POS = [(0, 20, 40), (64, 84, 104)]
 
 # 各市场交易时段（北京时间）
 # A股: 9:30-11:30, 13:00-15:00
@@ -286,7 +286,6 @@ def _draw(key, text, x, y, color):
 
 def us_session_label(status):
     """根据腾讯状态码返回美股时段标记"""
-    # 腾讯状态码：1=休盘, 200=正常交易, 其他=盘前/盘后等
     if status == 1:
         return "休盘"
     elif status == 200:
@@ -299,7 +298,24 @@ def render(data, page, tstr, force_clear):
     if force_clear:
         clear()
         _last = {}
+    # 右上角：北京时间（y=0）+ 美股时段标签（y=12，仅D页显示）
     _draw('t', tstr, 76, 0, C_FLAT)
+    # 判断当前页是否有美股
+    has_us = any(mkt == "US" for _, _, mkt in PAGES[page])
+    if has_us:
+        # 取第一个美股的时段标签
+        for _, code, mkt in PAGES[page]:
+            if mkt == "US":
+                rec = data.get(code)
+                if rec:
+                    label = us_session_label(rec[0])
+                else:
+                    label = ""
+                _draw('us', "%-5s" % label, 76, 12, C_FLAT)
+                break
+    else:
+        _draw('us', "%-5s" % "", 76, 12, C_FLAT)
+    # 两个指数：名称/价格/涨跌幅 三行
     for k in range(2):
         name, code, mkt = PAGES[page][k]
         ny, py, cy = POS[k]
@@ -310,33 +326,11 @@ def render(data, page, tstr, force_clear):
             _draw((k, 'c'), "%-8s" % "", 2, cy, C_FLAT)
             continue
         status, price, chg, pct, rname = rec
-        if mkt == "US":
-            # 美股：显示时段标记 + 价格 + 涨跌幅
-            label = us_session_label(status)
-            _draw((k, 's'), "%-5s" % label, 2, py, C_FLAT)
-            c = C_UP if pct > 0 else (C_DOWN if pct < 0 else C_FLAT)
-            _draw((k, 'p'), "%-9s" % ("%.2f" % price), 2, cy, c)
-        elif mkt in ("KR", "JP"):
-            # 韩国/日本：东财无状态码，用本地时段判断
-            ms = market_status(mkt)
-            if ms == "closed":
-                _draw((k, 'p'), "%-9s" % "休盘", 2, py, C_IDLE)
-                _draw((k, 'c'), "%-8s" % "", 2, cy, C_FLAT)
-            else:
-                c = C_UP if pct > 0 else (C_DOWN if pct < 0 else C_FLAT)
-                _draw((k, 'p'), "%-9s" % ("%.2f" % price), 2, py, c)
-                sign = "+" if pct >= 0 else ""
-                _draw((k, 'c'), "%-8s" % ("%s%.2f%%" % (sign, pct)), 2, cy, c)
-        else:
-            # A股：用腾讯状态码
-            if status == 1:
-                _draw((k, 'p'), "%-9s" % "休盘", 2, py, C_IDLE)
-                _draw((k, 'c'), "%-8s" % "", 2, cy, C_FLAT)
-            else:
-                c = C_UP if pct > 0 else (C_DOWN if pct < 0 else C_FLAT)
-                _draw((k, 'p'), "%-9s" % ("%.2f" % price), 2, py, c)
-                sign = "+" if pct >= 0 else ""
-                _draw((k, 'c'), "%-8s" % ("%s%.2f%%" % (sign, pct)), 2, cy, c)
+        # 所有市场统一显示：价格 + 涨跌幅（休盘时也是收盘价）
+        c = C_UP if pct > 0 else (C_DOWN if pct < 0 else C_FLAT)
+        _draw((k, 'p'), "%-9s" % ("%.2f" % price), 2, py, c)
+        sign = "+" if pct >= 0 else ""
+        _draw((k, 'c'), "%-8s" % ("%s%.2f%%" % (sign, pct)), 2, cy, c)
 
 def read_button():
     try:
