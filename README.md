@@ -143,7 +143,14 @@ mpremote connect COM3 reset
 | 纳斯达克(IXIC) | `gb_ixic` |
 | 费城半导体(SOX) | `gb_soxx` |
 
-> 新浪返回为 GBK 编码，但价格/涨跌幅均为 ASCII，用 `latin-1` 解码即可安全提取，无需 GBK 解码器。
+> **解码注意**：新浪返回是 GB18030 编码（含中文指数名）。
+> 不要整包 `body.decode("latin-1")` —— 本固件的 MicroPython **没有真正的 latin-1**，
+> 对不认识的 codec 名会静默退回 utf-8 语义，遇到 ≥0x80 的字节就抛 `UnicodeError`。
+> 代码里的做法是全流程按 `bytes` 处理，只对纯 ASCII 的数字字段逐个解码，因此不需要 GBK 解码器。
+
+> **收包注意**：新浪会**无视**请求头里的 `Connection: close`，回 `Connection: Keep-Alive`
+> 且不主动断连。所以不能"一直 `recv()` 到返回空"才算收完 —— 那样即使正文早就收齐，
+> 也会死等到 socket 超时。代码按响应头里的 `Content-Length` 精确收包。
 
 ## ⏰ 交易时段识别
 
@@ -161,12 +168,14 @@ mpremote connect COM3 reset
 ## 🛠️ 工作原理
 
 ```
-WiFi 连接 → NTP 校时 → 定时抓取行情(HTTP) → 解析行情 → ST7789 彩屏增量绘制
-     ↑                                                        │
-     └──────────────  A/B/C/D 按键切换页面  ←─────────────────┘
+WiFi 连接 → DNS 兜底校验 → NTP 校时 → 定时抓取行情(HTTP) → 解析行情 → ST7789 彩屏增量绘制
+     ↑                                                                      │
+     └──────────────────  A/B/C/D 按键切换页面  ←───────────────────────────┘
 ```
 
 - 用原生 `socket` 发起 HTTP 请求抓取行情（新浪为 `var hq_str_xxx="..."` 文本格式，东财为 JSON）
+- 连上 WiFi 后主动校验 DNS 可用性，必要时切换到公共 DNS（避免路由器不下发 DNS 导致全盘失效）
+- HTTP 收包按 `Content-Length` 精确读取，规避新浪的 `Keep-Alive` 不主动断连
 - 用板载教学库 `printChange231213` 的 `printXy()` 在彩屏上定位绘制
 - 维护一份「上次显示内容」缓存，只重画变化的字符位置（增量刷新），减少闪烁与 SPI 开销
 - 开机页的「涨停」Logo 以 1-bit 位平面压缩存储（zlib，364 字节），运行时解压后逐像素绘制
@@ -191,6 +200,53 @@ WiFi 连接 → NTP 校时 → 定时抓取行情(HTTP) → 解析行情 → ST7
   屏幕 160×128，小字号行高 16px、ASCII 约 8px/字符、CJK 约 16px/字符。
   当前 `POS = [(4, 24, 44), (68, 88, 108)]` 已上下居中（上下各余 4px），**改 `POS` 时记得同步改 `Y_*`，否则左右两列会错位**。
   改完跑 `python tools/make_pages_ascii.py` 重新生成上面的四页示意图，保持文档与代码同步。
+
+## 🔧 故障排查
+
+读取串口日志（115200 波特）是定位问题最快的方式。正常启动应该长这样：
+
+```
+Use HT protocol 240131 on OneS by IDF-V4.4.6
+NTP ok via ntp.aliyun.com
+BOOT wifi_ok=True
+SRC sina=1 tx=-1 em=0
+BOOT-FETCH ok:8 trade:False
+FETCH ok:8 trade:True t:15:34:56 cost:0.0s
+```
+
+`SRC` 行是数据源体检表：`1`=在用、`-1`=失败、`0`=未尝试。正常情况新浪一个源
+就能拿全 8 个指数，显示 `sina=1 tx=-1 em=0`。
+
+### 日期不对 + 所有行情都抓不到 → 先怀疑 DNS
+
+**这是最常见的故障，而且两个症状其实是同一个根因。**
+
+部分路由器的 DHCP **不下发 DNS 服务器**，`w.ifconfig()` 第 4 项会是 `0.0.0.0`。
+此时所有 `getaddrinfo()` 都抛 `OSError(-202)`，后果是双杀：
+
+1. NTP 校时失败 → RTC 停在出厂默认的 `2000/01/01`，**日期显示错误**；
+   连带星期也错，于是 `market_status()` 把所有市场都判成休盘
+2. 三个行情数据源的域名全都解析不了 → **一个指数都取不到**
+
+程序内置了 DNS 兜底：连上 WiFi 后会主动探测 DNS 是否真的能解析，不行就依次
+切换到公共 DNS（阿里 / DNSPod / 114 / Google），最后退回网关。生效时串口会打印：
+
+```
+DNS fallback -> 223.5.5.5
+```
+
+如果你的网络需要用别的 DNS，改 `DNS_FALLBACKS` 即可。
+
+### 用 PC 对照测试时记得关代理
+
+如果你的 PC 开了本地代理（环境变量里有 `http_proxy`），`curl`/`requests` 会走代理，
+而板子是直连的 —— 两者结果没有可比性，很容易得出"PC 能通板子不通"的错误结论。
+对照测试请显式绕过代理：
+
+```bash
+curl --noproxy '*' -H "Referer: http://finance.sina.com.cn" \
+  "http://hq.sinajs.cn/list=s_sh000001"
+```
 
 ## ⚠️ 注意事项
 

@@ -143,6 +143,43 @@ def log(msg):
     except Exception:
         pass
 
+# ===== DNS 兜底 =====
+# 部分路由器 DHCP 不下发 DNS 服务器（w.ifconfig() 第 4 项为 0.0.0.0）。
+# 此时所有 getaddrinfo 都会抛 OSError(-202)，后果是：NTP 校时失败（日期停在
+# 出厂默认 2000/01/01，星期也不对进而把所有市场判成休盘）+ 三个行情源全挂。
+# 因此连上 WiFi 后主动校验 DNS，不可用就依次试公共 DNS，用"能否解析出行情
+# 域名"作为判据，而不是只看配置项是否非零。
+DNS_FALLBACKS = ["223.5.5.5", "119.29.29.29", "114.114.114.114", "8.8.8.8"]
+DNS_PROBE_HOST = "qt.gtimg.cn"
+
+
+def _dns_works():
+    """当前 DNS 能否解析出 Probe 主机"""
+    try:
+        addr = socket.getaddrinfo(DNS_PROBE_HOST, 80)[0][-1]
+        return bool(addr and addr[0])
+    except Exception:
+        return False
+
+
+def ensure_dns(w):
+    """确保 DNS 可用，返回最终生效的 DNS；全部失败返回 '0.0.0.0'"""
+    ip, mask, gw, dns = w.ifconfig()
+    if dns and dns != "0.0.0.0" and _dns_works():
+        return dns
+    # 优先试公共 DNS，最后退回网关（不少路由器会代转发 DNS 查询）
+    for cand in DNS_FALLBACKS + ([gw] if gw and gw != "0.0.0.0" else []):
+        try:
+            w.ifconfig((ip, mask, gw, cand))
+            if _dns_works():
+                print("DNS fallback -> %s" % cand)
+                return cand
+        except Exception:
+            continue
+    print("DNS fallback FAILED")
+    return "0.0.0.0"
+
+
 def connect_wifi():
     w = network.WLAN(network.STA_IF)
     w.active(True)
@@ -150,22 +187,30 @@ def connect_wifi():
         w.connect(WIFI_SSID, WIFI_PASS)
         for _ in range(30):
             if w.isconnected():
-                return True
+                break
             time.sleep(0.5)
     try:
         w.config(pm=0)
     except Exception:
         pass
-    return w.isconnected()
+    ok = w.isconnected()
+    if ok:
+        ensure_dns(w)
+    return ok
+
 
 def sync_time():
-    try:
-        import ntptime
-        ntptime.host = "ntp.aliyun.com"
-        ntptime.settime()
-        return True
-    except Exception:
-        return False
+    """多 NTP 源依次尝试，任意一个成功即可"""
+    for host in ("ntp.aliyun.com", "pool.ntp.org", "cn.pool.ntp.org"):
+        try:
+            import ntptime
+            ntptime.host = host
+            ntptime.settime()
+            print("NTP ok via %s" % host)
+            return True
+        except Exception as e:
+            print("NTP fail %s: %r" % (host, e))
+    return False
 
 def beijing_time():
     try:
@@ -273,6 +318,71 @@ def dechunk(body):
         body = body[nl + 2 + size + 2:]
     return out
 
+def _recv_headers(s):
+    """读到响应头结束，返回 (head, 头部之后已经顺带收到的正文片段)
+
+    注意 recv 返回的字节里可能已经包含了部分正文，必须交还给调用方，
+    否则这部分数据会丢。
+    """
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        c = s.recv(256)
+        if not c:
+            break
+        buf += c
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    return head, rest
+
+
+def _read_body(s, head, rest):
+    """按响应头把正文读完。
+
+    关键坑：新浪会**无视**请求里的 `Connection: close`，回 `Connection:
+    Keep-Alive` 且不主动断连。老写法是 `while True: recv(); if not c:
+    break`，即"一直读到对端关闭为止" —— 于是即便 Content-Length 指定的
+    正文早就收齐了，也仍会死等到 socket 超时（实测每轮白等 3 秒后抛
+    OSError(116)，导致主力源被误判为失败）。腾讯/东财正常只是因为它们
+    肯主动断连，属于侥幸。
+
+    因此这里优先按 Content-Length 精确收包，chunked 读到 0 长度块为止，
+    两者都没有时才退回"读到对端关闭"。
+    """
+    hl = head.lower()
+    if b"transfer-encoding: chunked" in hl:
+        body = rest
+        while b"\r\n0\r\n\r\n" not in body and b"\r\n0\r\n" not in body:
+            c = s.recv(256)
+            if not c:
+                break
+            body += c
+        return dechunk(body)
+
+    n = -1
+    i = hl.find(b"content-length:")
+    if i >= 0:
+        j = hl.find(b"\r\n", i)
+        try:
+            n = int(hl[i + 15:j].strip())
+        except Exception:
+            n = -1
+    if n >= 0:
+        body = rest
+        while len(body) < n:
+            c = s.recv(256)
+            if not c:
+                break
+            body += c
+        return body[:n]
+
+    body = rest
+    while True:
+        c = s.recv(256)
+        if not c:
+            break
+        body += c
+    return body
+
+
 def http_get(host, path):
     if host not in _DNS:
         _DNS[host] = socket.getaddrinfo(host, 80)[0][-1]
@@ -281,16 +391,8 @@ def http_get(host, path):
         s.settimeout(5)
         s.connect(_DNS[host])
         s.send(("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n" % (path, host)).encode())
-        buf = b""
-        while True:
-            c = s.recv(1024)
-            if not c:
-                break
-            buf += c
-        head, _, body = buf.partition(b"\r\n\r\n")
-        if b"chunked" in head.lower():
-            body = dechunk(body)
-        return body
+        head, rest = _recv_headers(s)
+        return _read_body(s, head, rest)
     finally:
         try:
             s.close()
@@ -360,62 +462,79 @@ EM_SECIDS = "100.KS11,100.N225"
 # 数据源状态：0=未尝试,1=可用,-1=失败
 _source_status = {"sina": 0, "tx": 0, "em": 0}
 
+def _num(bs):
+    """把一段纯 ASCII 数字字节转成 float。
+
+    行情报文里的数字都是 ASCII，逐字段解码即可绕开中文（详见 fetch_sina
+    中关于 latin-1 的说明）。
+    """
+    return float(bs.decode())
+
+
 def fetch_sina():
     """新浪单请求8个指数。返回 {内部code: (price, chg, pct)} 或空dict"""
     result = {}
     qstr = ",".join(SINA_CODES)
     try:
         s = socket.socket()
+        # 5s：新浪 Keep-Alive 的场景下已在 _read_body 里按 Content-Length 精确
+        # 收包，正常几百毫秒就结束；这里只是兜住真正的网络异常
         s.settimeout(5)
         addr = socket.getaddrinfo("hq.sinajs.cn", 80)[0][-1]
         s.connect(addr)
-        # 新浪必须带 Referer
+        # 新浪必须带 Referer：实测不带时服务器连一个字节都不回（直接超时）
         req = "GET /list=%s HTTP/1.1\r\nHost: hq.sinajs.cn\r\nReferer: http://finance.sina.com.cn\r\nConnection: close\r\n\r\n" % qstr
         s.send(req.encode())
-        buf = b""
-        while True:
-            c = s.recv(1024)
-            if not c:
-                break
-            buf += c
+        # 新浪回 Connection: Keep-Alive 且不断连，必须按 Content-Length 收
+        head, rest = _recv_headers(s)
+        body = _read_body(s, head, rest)
         s.close()
-        head, _, body = buf.partition(b"\r\n\r\n")
-        # 新浪返回GBK编码，但我们只需要数字字段（ASCII），用latin-1安全解码
-        text = body.decode("latin-1")
-        for line in text.split("\n"):
-            if '="' not in line:
+        # 全程按 bytes 处理，只对每个数字字段单独解码。
+        #
+        # 不能整包 body.decode("latin-1")：新浪正文是 GB18030，含中文指数名
+        # （如 "\xb4\xf3\xc5\xcc"）。而本固件的 MicroPython（737320dbc-dirty
+        # / ESP32-S2）**没有真正的 latin-1** —— 对不认识的 codec 名会静默
+        # 退回 utf-8 语义，于是凡 >=0x80 的字节一律抛 UnicodeError，整个
+        # 新浪源被误判为死亡。数字字段本来就是纯 ASCII，逐字段解码即可。
+        for line in body.split(b"\n"):
+            if b'="' not in line:
                 continue
             try:
-                varpart, val = line.split('="', 1)
-                val = val.rstrip('";\r\n')
+                varpart, val = line.split(b'="', 1)
+                val = val.rstrip(b'";\r\n')
                 if not val:
                     continue
-                # varpart 形如 var hq_str_s_sh000001
-                sina_code = varpart.split("_")[-1]
+                # varpart 形如 b'var hq_str_s_sh000001'。
+                # 必须剥掉 'hq_str_' 前缀而不是取最后一个 '_' 之后的部分：
+                # 后者会把 's_sh000001' 砍成 'sh000001'、'gb_ixic' 砍成
+                # 'ixic'，而 SINA_MAP 的键是完整代码，查表全落空 -> 新浪源
+                # 一个指数都取不到，被整体判死（实测 8 条全 MISS）。
+                varname = varpart.split()[-1]
+                sina_code = varname[len(b"hq_str_"):].decode()
                 inner_code = SINA_MAP.get(sina_code)
                 if not inner_code:
                     continue
-                fields = val.split(",")
+                fields = val.split(b",")
                 if sina_code.startswith("s_"):
                     # A股简版: 名称,现价,涨跌额,涨跌幅,...
-                    price = float(fields[1])
-                    pct = float(fields[3])
-                    chg = float(fields[2])
+                    price = _num(fields[1])
+                    pct = _num(fields[3])
+                    chg = _num(fields[2])
                 elif sina_code.startswith("gb_"):
                     # 美股: 名称,现价,涨跌幅%,时间,涨跌额,...
-                    price = float(fields[1])
-                    pct = float(fields[2])
-                    chg = float(fields[4])
+                    price = _num(fields[1])
+                    pct = _num(fields[2])
+                    chg = _num(fields[4])
                 elif sina_code == "b_KOSPI":
                     # 韩国: 名称,现价,涨跌额,涨跌幅,...
-                    price = float(fields[1])
-                    chg = float(fields[2])
-                    pct = float(fields[3])
+                    price = _num(fields[1])
+                    chg = _num(fields[2])
+                    pct = _num(fields[3])
                 elif sina_code == "int_nikkei":
                     # 日经: 名称,现价,涨跌额,涨跌幅
-                    price = float(fields[1])
-                    chg = float(fields[2])
-                    pct = float(fields[3])
+                    price = _num(fields[1])
+                    chg = _num(fields[2])
+                    pct = _num(fields[3])
                 else:
                     continue
                 result[inner_code] = (price, chg, pct)
@@ -424,6 +543,13 @@ def fetch_sina():
     except Exception:
         pass
     return result
+
+def _log_src():
+    """打印实际生效的数据源，便于串口排查（1=在用, -1=失败, 0=未尝试）"""
+    print("SRC sina=%d tx=%d em=%d" % (_source_status["sina"],
+                                       _source_status["tx"],
+                                       _source_status["em"]))
+
 
 def fetch_all():
     """返回 (data_dict, any_trading)
@@ -442,12 +568,17 @@ def fetch_all():
             _source_status["tx"] = -1   # 新浪可用时不用备用
             for code, (p, c, pct) in sina_data.items():
                 data[code] = (200, p, c, pct, "")   # 新浪无状态码，用200占位
-                any_trading = True   # 新雄无法判断休盘，默认trading让UI刷新
-            # 用本地时段修正 any_trading
+            # 新浪无法判断休盘，用本地时段推算
             any_trading = check_any_trading()
+            _log_src()
             return data, any_trading
         else:
+            # 关键：新浪失败时要把腾讯重新置为"待尝试"。
+            # 否则一旦新浪曾经成功过（那时会把 tx 置 -1），之后新浪偶发失败
+            # 就会导致腾讯分支被跳过，只剩东财，A股和美股全缺。
             _source_status["sina"] = -1
+            if _source_status["tx"] < 0:
+                _source_status["tx"] = 0
 
     # 备用1：腾讯(A股+美股) + 东财(韩国+日本)
     if _source_status["tx"] >= 0:
@@ -472,6 +603,7 @@ def fetch_all():
     except Exception:
         _source_status["em"] = -1
 
+    _log_src()
     return data, any_trading
 
 def check_any_trading():
@@ -554,6 +686,7 @@ def main():
     # 首次抓取
     data, trading = fetch_all()
     last_fetch = time.time()
+    print("BOOT-FETCH ok:%d trade:%s" % (len(data), trading))
     render(data, page, beijing_time(), True)
     last_sec = int(time.time())
     while True:
