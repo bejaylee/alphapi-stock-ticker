@@ -585,11 +585,19 @@ def _log_src():
                                        _source_status["em"]))
 
 
+# 各页面用到的全部内部 code（用于检测缺失并触发备用源补齐）
+ALL_CODES = ["sh000001", "sz399006", "sz399001", "sh000688", "KS11", "N225", "usSOXQ", "usQQQ"]
+
 def fetch_all():
     """返回 (data_dict, any_trading)
     主力=新浪(单请求8个)，备用=腾讯+东财。自动切换。
     data = {内部code: (status, price, chg, pct, "")}
-    status: 新浪/东财无状态码用200占位；腾讯用真实状态码"""
+    status: 新浪/东财无状态码用200占位；腾讯用真实状态码
+
+    容错策略：新浪偶发会缺 gb_qqq/gb_soxq 中某条（返回 7 条甚至 6 条），
+    旧逻辑只看 len>=6 就整体采用并 return，导致 D 页缺 key 显示横杠。
+    现改为：新浪可用时先落数据，再检查全量缺失项，缺 A股/美股用腾讯补、
+    缺韩日用东财补，补不齐才整页回退。"""
     global _source_status
     data = {}
     any_trading = False
@@ -599,9 +607,27 @@ def fetch_all():
         sina_data = fetch_sina()
         if len(sina_data) >= 6:   # 至少6个成功才算可用
             _source_status["sina"] = 1
-            _source_status["tx"] = -1   # 新浪可用时不用备用
             for code, (p, c, pct) in sina_data.items():
                 data[code] = (200, p, c, pct, "")   # 新浪无状态码，用200占位
+            # 检测缺失项，用备用源补齐（不因个别缺失就整页弃用新浪）
+            missing = [c for c in ALL_CODES if c not in data]
+            if missing:
+                # 腾讯能补 A股(sh/sz) 和美股(us)；东财能补韩日(KS11/N225)
+                # 注意：本固件 MicroPython 的 str.startswith 不接受 tuple 参数
+                # （传 tuple 会报 can't convert 'tuple' object to str），用切片判断。
+                tx_needed = [c for c in missing if c[:2] in ("sh", "sz", "us")]
+                em_needed = [c for c in missing if c in ("KS11", "N225")]
+                if tx_needed:
+                    tx = fetch_tx_batch(tx_needed)
+                    for code, (st, p, c, pct, n) in tx.items():
+                        data[code] = (st, p, c, pct, n)
+                        if st != 1:
+                            any_trading = True
+                    # 腾讯补到的，更新状态
+                    if tx:
+                        _source_status["tx"] = 1
+                if em_needed:
+                    _em_fill(data, em_needed)
             # 新浪无法判断休盘，用本地时段推算
             any_trading = check_any_trading()
             _log_src()
@@ -614,7 +640,7 @@ def fetch_all():
             if _source_status["tx"] < 0:
                 _source_status["tx"] = 0
 
-    # 备用1：腾讯(A股+美股) + 东财(韩国+日本)
+    # 备用1：腾讯(A股+美股)
     if _source_status["tx"] >= 0:
         tx = fetch_tx_batch(TX_CODES)
         if len(tx) >= 4:
@@ -627,18 +653,25 @@ def fetch_all():
             _source_status["tx"] = -1
 
     # 备用2：东财延迟站(韩国+日本)
+    _em_fill(data, ["KS11", "N225"])
+
+    _log_src()
+    return data, any_trading
+
+def _em_fill(data, codes):
+    """从东财延迟站补齐指定 code（韩国/日本），失败不影响主流程"""
+    if not codes:
+        return
     try:
         path = "/api/qt/ulist.np/get?fltt=2&secids=" + EM_SECIDS + "&fields=f2,f3,f4,f12"
         d = json.loads(http_get("push2delay.eastmoney.com", path).decode("utf-8"))
         for it in d["data"]["diff"]:
             code = it["f12"]
-            data[code] = (200, it["f2"], it["f4"], it["f3"], "")
-            _source_status["em"] = 1
+            if code in codes:
+                data[code] = (200, it["f2"], it["f4"], it["f3"], "")
+                _source_status["em"] = 1
     except Exception:
         _source_status["em"] = -1
-
-    _log_src()
-    return data, any_trading
 
 def check_any_trading():
     """根据本地时段判断是否有任何市场在交易"""
