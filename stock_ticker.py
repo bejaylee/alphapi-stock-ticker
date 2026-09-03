@@ -4,6 +4,7 @@
 #  ESP32-S2 + MicroPython 实时指数看板。
 #  特性：按市场识别盘中/休盘，休盘不抓数据；美股显示盘前/盘中/
 #  盘后标记；红涨绿跌；北京时间到秒；增量刷新减少闪烁。
+#  美股采用 ETF(SOXQ/QQQ) 而非指数，以支持盘前/盘后实时行情。
 #
 #  使用方法：
 #    1. 修改下方 WIFI_SSID / WIFI_PASS 为你自己的 WiFi
@@ -12,7 +13,7 @@
 #    3. 按键 A/B/C/D 切换页面
 #
 #  运行环境：AlphaPi One S v1.7（ESP32-S2，MicroPython 1.19.1）
-#  数据源：腾讯免费行情接口（无需 Key，返回含交易状态码）
+#  数据源：新浪主力（单请求 8 指数）+ 腾讯/东财备用，自动降级
 # ============================================================
 import time
 import network, socket, machine
@@ -24,14 +25,26 @@ import hal
 from machine import WDT
 from printChange231213 import clear, printXy, tft
 import zlib
+import gc
 
 # ===== 必改：填入你的 WiFi 信息 =====
 WIFI_SSID = "YOUR_WIFI_SSID"
 WIFI_PASS = "YOUR_WIFI_PASSWORD"
 # ===================================
 
-REFRESH_SEC = 2         # 盘中数据刷新间隔（秒）
+REFRESH_SEC = 5         # 盘中数据刷新间隔（秒）
 IDLE_REFRESH_SEC = 30   # 休盘时的探测间隔（秒，只查状态不抓全量）
+
+# ===== ESP32-S2 DMA 稳定性调节 =====
+# WiFi(lwIP) 与 ST7789 SPI 渲染共用 DMA 资源，在 S2 上会间歇性争抢导致冻结。
+# 纯软件无法根除，以下参数用于降低争抢频率、减少堆碎片、加速看门狗恢复。
+DMA_SETTLE_MS = 30      # fetch 与 render 之间留给 WiFi 后台 DMA 排空的毫秒数
+WDT_TIMEOUT_MS = 15000  # 看门狗超时（毫秒），冻结时自动重启
+
+# 按键去抖：实测 B 键触点抖动在 100ms 内跳变 3 次，read_button 瞬时采样会
+# 把抖动放大成"切页迟钝/闪烁"。改为连续采样确认稳定后才判定按下。
+DEBOUNCE_COUNT = 5      # 连续 N 次采样都为高才算稳定按下
+DEBOUNCE_STEP_MS = 10   # 每次采样间隔（毫秒），总去抖窗口 = 5×10 = 50ms
 
 C_NAME  = 'yellow'
 C_UP    = 'red'
@@ -47,7 +60,7 @@ PAGES = [
     [("上证指数", "sh000001", "CN"), ("创业板指", "sz399006", "CN")],
     [("深证成指", "sz399001", "CN"), ("科创50",   "sh000688", "CN")],
     [("韩国综合", "KS11",     "KR"), ("日经225",   "N225",     "JP")],
-    [("SOX",      "usSOXX",   "US"), ("IXIC",      "usIXIC",   "US")],
+    [("SOXQ",     "usSOXQ",   "US"), ("QQQ",       "usQQQ",    "US")],
 ]
 # 纵向整体下移 4px 以实现上下居中：
 #   内容纵向占 y=0~119 共 120px，屏高 128 → 原本上余 0 / 下余 8，偏移后上下各余 4px。
@@ -414,7 +427,7 @@ def parse_tx(raw):
 
 # 批量请求多个腾讯代码（一次HTTP请求，用逗号分隔）
 def fetch_tx_batch(codes):
-    """codes: list of str like ['sh000001','usIXIC']。返回 {code: (status,price,chg,pct,name)}"""
+    """codes: list of str like ['sh000001','usQQQ']。返回 {code: (status,price,chg,pct,name)}"""
     result = {}
     qstr = ",".join(codes)
     try:
@@ -446,16 +459,19 @@ def fetch_tx_batch(codes):
 
 # ============= 数据源配置 =============
 # 新浪代码 → 统一内部code
-SINA_CODES = ["s_sh000001", "s_sz399006", "s_sz399001", "s_sh000688", "b_KOSPI", "int_nikkei", "gb_ixic", "gb_soxx"]
+# 美股用 ETF 而非指数：指数(IXIC/SOX)交易所盘前盘后不计算，新浪 gb_ 的
+# 盘前盘后数据段恒为空，只能显示收盘价；ETF(QQQ/SOXQ)盘前盘后有真实成交，
+# 配合 fetch_sina 的 ext 段解析才能真正拿到盘前盘后实时行情。
+SINA_CODES = ["s_sh000001", "s_sz399006", "s_sz399001", "s_sh000688", "b_KOSPI", "int_nikkei", "gb_qqq", "gb_soxq"]
 # 新浪code → 内部code 映射
 SINA_MAP = {
     "s_sh000001": "sh000001", "s_sz399006": "sz399006",
     "s_sz399001": "sz399001", "s_sh000688": "sh000688",
     "b_KOSPI": "KS11", "int_nikkei": "N225",
-    "gb_ixic": "usIXIC", "gb_soxx": "usSOXX",
+    "gb_qqq": "usQQQ", "gb_soxq": "usSOXQ",
 }
 # 腾讯备用
-TX_CODES = ["sh000001", "sz399006", "sz399001", "sh000688", "usSOXX", "usIXIC"]
+TX_CODES = ["sh000001", "sz399006", "sz399001", "sh000688", "usSOXQ", "usQQQ"]
 # 东财备用
 EM_SECIDS = "100.KS11,100.N225"
 
@@ -506,8 +522,8 @@ def fetch_sina():
                     continue
                 # varpart 形如 b'var hq_str_s_sh000001'。
                 # 必须剥掉 'hq_str_' 前缀而不是取最后一个 '_' 之后的部分：
-                # 后者会把 's_sh000001' 砍成 'sh000001'、'gb_ixic' 砍成
-                # 'ixic'，而 SINA_MAP 的键是完整代码，查表全落空 -> 新浪源
+                # 后者会把 's_sh000001' 砍成 'sh000001'、'gb_qqq' 砍成
+                # 'qqq'，而 SINA_MAP 的键是完整代码，查表全落空 -> 新浪源
                 # 一个指数都取不到，被整体判死（实测 8 条全 MISS）。
                 varname = varpart.split()[-1]
                 sina_code = varname[len(b"hq_str_"):].decode()
@@ -525,6 +541,24 @@ def fetch_sina():
                     price = _num(fields[1])
                     pct = _num(fields[2])
                     chg = _num(fields[4])
+                    # 盘前/盘后：新浪把 extended session 数据放在 [21]~[24]，
+                    # 而 [1]/[2]/[4] 冻结在正式收盘价。实测(2026-09-03 盘后)
+                    # gb_soxx 曾出现 [1] 锁死 501.44 而 [21] 一路跌到 497.28
+                    # (盘后 -4.16%)，只读 [1] 就永远显示"不动的收盘价"。
+                    #   [21]=盘前/盘后最新价 [22]=涨跌幅%(相对收盘) [23]=涨跌额
+                    #   [24]=盘前/盘后时间戳 [25]=收盘时间戳      [26]=昨收
+                    # 涨跌幅用昨收[26]自算，与盘中口径一致（[22]是相对收盘）。
+                    # 指数盘前盘后无行情 -> [21] 恒为 0 天然回退收盘；现已改用
+                    # ETF，仍保留此回退以防 ETF 盘前无成交或未来换回指数。
+                    try:
+                        ext_px = _num(fields[21])
+                        prev = _num(fields[26])
+                        if ext_px > 0 and prev > 0:
+                            price = ext_px
+                            chg = ext_px - prev
+                            pct = chg / prev * 100.0
+                    except Exception:
+                        pass
                 elif sina_code == "b_KOSPI":
                     # 韩国: 名称,现价,涨跌额,涨跌幅,...
                     price = _num(fields[1])
@@ -655,10 +689,19 @@ def render(data, page, tstr, force_clear):
         _draw((k, 'c'), "%-8s" % ("%s%.2f%%" % (sign, pct)), 2, cy, c)
 
 def read_button():
+    """读按键，带软件去抖。检测到高电平后连续采样确认稳定才返回键号，
+    否则视为触点抖动忽略（实测 B 键 100ms 内跳变 3 次，见 key_debug 采样）。"""
     try:
         for k, pin in hal.key_map.items():
             if pin.value() == 1:
-                return k
+                ok = True
+                for _ in range(DEBOUNCE_COUNT):
+                    time.sleep_ms(DEBOUNCE_STEP_MS)
+                    if pin.value() != 1:
+                        ok = False
+                        break
+                if ok:
+                    return k
     except Exception:
         pass
     return 0
@@ -680,13 +723,14 @@ def main():
     last_log = 0
     wdt = None
     try:
-        wdt = WDT(timeout=20000)
+        wdt = WDT(timeout=WDT_TIMEOUT_MS)
     except Exception:
         wdt = None
     # 首次抓取
     data, trading = fetch_all()
     last_fetch = time.time()
     print("BOOT-FETCH ok:%d trade:%s" % (len(data), trading))
+    gc.collect()
     render(data, page, beijing_time(), True)
     last_sec = int(time.time())
     while True:
@@ -707,9 +751,18 @@ def main():
             data, trading = fetch_all()
             _cost = time.time() - _t
             last_fetch = now
-            print("FETCH ok:%d trade:%s t:%s cost:%.1fs" % (len(data), trading, beijing_time(), _cost))
+            # fetch 后立即回收 socket/HTTP 缓冲，避免 render 阶段分配 SPI
+            # 传输缓冲时踩到碎片化堆（ESP32-S2 DMA 冻结的高频诱因）
+            gc.collect()
+            if wdt is not None:
+                wdt.feed()
+            print("FETCH ok:%d trade:%s t:%s cost:%.1fs free:%d" % (len(data), trading, beijing_time(), _cost, gc.mem_free()))
         cur_sec = int(now)
         if cur_sec != last_sec:
+            # render 前留点时间让 WiFi 后台 DMA 排空，再收一次碎片
+            if DMA_SETTLE_MS:
+                time.sleep_ms(DMA_SETTLE_MS)
+            gc.collect()
             render(data, page, beijing_time(), False)
             last_sec = cur_sec
         if now - last_log >= 30:
