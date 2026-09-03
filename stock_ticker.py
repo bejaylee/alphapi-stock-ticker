@@ -32,7 +32,7 @@ WIFI_SSID = "YOUR_WIFI_SSID"
 WIFI_PASS = "YOUR_WIFI_PASSWORD"
 # ===================================
 
-REFRESH_SEC = 5         # 盘中数据刷新间隔（秒）
+REFRESH_SEC = 2         # 盘中数据刷新间隔（秒）
 IDLE_REFRESH_SEC = 30   # 休盘时的探测间隔（秒，只查状态不抓全量）
 
 # ===== ESP32-S2 DMA 稳定性调节 =====
