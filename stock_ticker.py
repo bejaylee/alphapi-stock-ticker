@@ -477,6 +477,49 @@ EM_SECIDS = "100.KS11,100.N225"
 
 # 数据源状态：0=未尝试,1=可用,-1=失败
 _source_status = {"sina": 0, "tx": 0, "em": 0}
+# 各源最近一次失败的时间戳(秒)。"失败"不等于"永久禁用"，冷却结束后自动重试。
+_source_fail_at = {"sina": 0, "tx": 0, "em": 0}
+# 失败源的冷却重试间隔(秒)
+#
+# 背景(2026-09-05 修复 D 页长期横杠)：旧逻辑存在**状态机死锁** ——
+#   sina 与 tx 一旦同时失败就会永久卡死，A股/美股长期缺失，
+#   D 页一直显示横杠，只能靠重启设备恢复（实测持续数十分钟，软复位后立刻正常）。
+# 死锁成因：sina=-1 时 fetch_all 会整体跳过新浪分支，而"新浪失败时把 tx
+# 重置为待尝试"那行补偿代码恰好写在该分支的 else 内，从此永远执行不到；
+# tx=-1 又让腾讯分支一并跳过。于是只剩东财(仅韩日)，美股数据永久缺失。
+# 现改为：失败的源冷却 SOURCE_RETRY_SEC 秒后自动重新尝试，死锁可自愈。
+SOURCE_RETRY_SEC = 30
+
+def _src_available(name):
+    """本轮是否应尝试该源。-1(失败)的源冷却期满后自动恢复为待尝试。"""
+    if _source_status[name] >= 0:
+        return True
+    t = _source_fail_at[name]
+    if t:
+        try:
+            if (time.time() - t) >= SOURCE_RETRY_SEC:
+                _source_status[name] = 0
+                _source_fail_at[name] = 0
+                return True
+            return False
+        except Exception:
+            return True
+    # 失败却没记上时间戳（异常路径）：放行重试，绝不永久禁用
+    _source_status[name] = 0
+    return True
+
+def _src_ok(name):
+    _source_status[name] = 1
+    _source_fail_at[name] = 0
+
+def _src_fail(name):
+    _source_status[name] = -1
+    try:
+        _source_fail_at[name] = time.time()
+    except Exception:
+        _source_fail_at[name] = 0
+    # 留下串口线索，便于事后判断是短暂抖动还是源真的挂了
+    print("SRC-FAIL %s cooldown=%ds" % (name, SOURCE_RETRY_SEC))
 
 def _num(bs):
     """把一段纯 ASCII 数字字节转成 float。
@@ -606,10 +649,10 @@ def fetch_all():
     any_trading = False
 
     # 主力：新浪
-    if _source_status["sina"] >= 0:
+    if _src_available("sina"):
         sina_data = fetch_sina()
         if len(sina_data) >= 6:   # 至少6个成功才算可用
-            _source_status["sina"] = 1
+            _src_ok("sina")
             for code, (p, c, pct) in sina_data.items():
                 data[code] = (200, p, c, pct, "")   # 新浪无状态码，用200占位
             # 检测缺失项，用备用源补齐（不因个别缺失就整页弃用新浪）
@@ -628,7 +671,7 @@ def fetch_all():
                             any_trading = True
                     # 腾讯补到的，更新状态
                     if tx:
-                        _source_status["tx"] = 1
+                        _src_ok("tx")
                 if em_needed:
                     _em_fill(data, em_needed)
             # 日经225 必须用东财覆盖：新浪 int_nikkei 的数据是陈旧的。
@@ -642,24 +685,24 @@ def fetch_all():
             _log_src()
             return data, any_trading
         else:
-            # 关键：新浪失败时要把腾讯重新置为"待尝试"。
-            # 否则一旦新浪曾经成功过（那时会把 tx 置 -1），之后新浪偶发失败
-            # 就会导致腾讯分支被跳过，只剩东财，A股和美股全缺。
-            _source_status["sina"] = -1
-            if _source_status["tx"] < 0:
-                _source_status["tx"] = 0
+            # 新浪失败：立刻把腾讯置为"待尝试"，让它本轮就顶上补 A股/美股。
+            # 不能只依赖 _src_available 的冷却，否则新浪一挂，A股/美股要空
+            # 整整一个冷却周期才有源来填。
+            _src_fail("sina")
+            _source_status["tx"] = 0
+            _source_fail_at["tx"] = 0
 
     # 备用1：腾讯(A股+美股)
-    if _source_status["tx"] >= 0:
+    if _src_available("tx"):
         tx = fetch_tx_batch(TX_CODES)
         if len(tx) >= 4:
-            _source_status["tx"] = 1
+            _src_ok("tx")
             for code, (st, p, c, pct, n) in tx.items():
                 data[code] = (st, p, c, pct, n)
                 if st != 1:
                     any_trading = True
         else:
-            _source_status["tx"] = -1
+            _src_fail("tx")
 
     # 备用2：东财延迟站(韩国+日本)
     _em_fill(data, ["KS11", "N225"])
@@ -678,9 +721,9 @@ def _em_fill(data, codes):
             code = it["f12"]
             if code in codes:
                 data[code] = (200, it["f2"], it["f4"], it["f3"], "")
-                _source_status["em"] = 1
+                _src_ok("em")
     except Exception:
-        _source_status["em"] = -1
+        _src_fail("em")
 
 def check_any_trading():
     """根据本地时段判断是否有任何市场在交易"""
