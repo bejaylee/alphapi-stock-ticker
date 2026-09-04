@@ -566,6 +566,9 @@ def fetch_sina():
                     pct = _num(fields[3])
                 elif sina_code == "int_nikkei":
                     # 日经: 名称,现价,涨跌额,涨跌幅
+                    # ⚠️ 该接口数据是陈旧的！实测 2026-09-03 返回 44946.64，
+                    # 而当日真实收盘为 64214.48（东财/中新经纬一致），差 42%。
+                    # 此处解析结果仅作兜底，fetch_all 会用东财覆盖正确值。
                     price = _num(fields[1])
                     chg = _num(fields[2])
                     pct = _num(fields[3])
@@ -628,6 +631,12 @@ def fetch_all():
                         _source_status["tx"] = 1
                 if em_needed:
                     _em_fill(data, em_needed)
+            # 日经225 必须用东财覆盖：新浪 int_nikkei 的数据是陈旧的。
+            # 实测 2026-09-03：新浪返回 44946.64，而权威行情（东财/中新经纬）
+            # 当日收盘为 64214.48 —— 差 42%，新浪值是过期数据。
+            # 韩国 KS11 新浪与东财一致（6579.48），无需覆盖。
+            # 东财若失败则保留新浪值兜底（宁可旧值也比没值强）。
+            _em_fill(data, ["N225"])
             # 新浪无法判断休盘，用本地时段推算
             any_trading = check_any_trading()
             _log_src()
